@@ -11,6 +11,10 @@ In contrast, volatile memory needs constant power in order to retain data.
 #include <stddef.h>
 #include <stdbool.h>
 #include <pthread.h>
+#include <stdio.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <sys/stat.h>
 
 /*
 magic, version, pagesize, 
@@ -248,7 +252,7 @@ struct wal_buffer {
 struct wal_context {
     char *wal_file_path;  
     int wal_file_fd;
-    bool is_open;
+    _Bool is_open;
 
     struct wal_buffer buffer;
 
@@ -269,8 +273,9 @@ struct wal_context {
     // Synchronization
     pthread_mutex_t wal_lock;    // Main WAL lock
     pthread_cond_t flush_cond;   // Condition for flush notification
-    bool flush_requested;        // Flush requested flag
-    bool checkpoint_requested;   // Checkpoint requested flag
+    // bool warning 
+    _Bool flush_requested;        // Flush requested flag
+    _Bool checkpoint_requested;   // Checkpoint requested flag
 
     // Callbacks
     void (*on_flush)(void *ctx);           // Called after flush
@@ -279,7 +284,7 @@ struct wal_context {
     void *callback_ctx;                     // Context for callbacks
 
     // Recovery state
-    bool in_recovery;            // Is recovery in progress
+    _Bool in_recovery;            // Is recovery in progress
     uint32_t recovery_errors;    // Number of errors during recovery
 };
 
@@ -287,6 +292,392 @@ struct wal_operation {
     struct wal_context *context; 
     uint64_t lsn;     
     uint64_t transaction_id;    
-    bool is_active;    
-    bool needs_commit; 
+    _Bool is_active;    
+    _Bool needs_commit; 
 };
+
+static uint32_t crc32_table[256];
+static _Bool crc32_initialized = false;
+
+static const int CRC32_POLY = 0xEDB88320;
+
+static const uint32_t crc32_table[256] = {
+    0x00000000, 0x77073096, 0xEE0E612C, 0x990951BA,
+    0x076DC419, 0x706AF48F, 0xE963A535, 0x9E6495A3,
+    0x0EDB8832, 0x79DCB8A4, 0xE0D5E91E, 0x97D2D988,
+    0x09B64C2B, 0x7EB17CBD, 0xE7B82D07, 0x90BF1D91,
+    0x1DB71064, 0x6AB020F2, 0xF3B97148, 0x84BE41DE,
+    0x1ADAD47D, 0x6DDDE4EB, 0xF4D4B551, 0x83D385C7,
+    0x136C9856, 0x646BA8C0, 0xFD62F97A, 0x8A65C9EC,
+    0x14015C4F, 0x63066CD9, 0xFA0F3D63, 0x8D080DF5,
+    0x3B6E20C8, 0x4C69105E, 0xD56041E4, 0xA2677172,
+    0x3C03E4D1, 0x4B04D447, 0xD20D85FD, 0xA50AB56B,
+    0x35B5A8FA, 0x42B2986C, 0xDBBBC9D6, 0xACBCF940,
+    0x32D86CE3, 0x45DF5C75, 0xDCD60DCF, 0xABD13D59,
+    0x26D930AC, 0x51DE003A, 0xC8D75180, 0xBFD06116,
+    0x21B4F4B5, 0x56B3C423, 0xCFBA9599, 0xB8BDA50F,
+    0x2802B89E, 0x5F058808, 0xC60CD9B2, 0xB10BE924,
+    0x2F6F7C87, 0x58684C11, 0xC1611DAB, 0xB6662D3D,
+    0x76DC4190, 0x01DB7106, 0x98D220BC, 0xEFD5102A,
+    0x71B18589, 0x06B6B51F, 0x9FBFE4A5, 0xE8B8D433,
+    0x7807C9A2, 0x0F00F934, 0x9609A88E, 0xE10E9818,
+    0x7F6A0DBB, 0x086D3D2D, 0x91646C97, 0xE6635C01,
+    0x6B6B51F4, 0x1C6C6162, 0x856530D8, 0xF262004E,
+    0x6C0695ED, 0x1B01A57B, 0x8208F4C1, 0xF50FC457,
+    0x65B0D9C6, 0x12B7E950, 0x8BBEB8EA, 0xFCB9887C,
+    0x62DD1DDF, 0x15DA2D49, 0x8CD37CF3, 0xFBD44C65,
+    0x4DB26158, 0x3AB551CE, 0xA3BC0074, 0xD4BB30E2,
+    0x4ADFA541, 0x3DD895D7, 0xA4D1C46D, 0xD3D6F4FB,
+    0x4369E96A, 0x346ED9FC, 0xAD678846, 0xDA60B8D0,
+    0x44042D73, 0x33031DE5, 0xAA0A4C5F, 0xDD0D7CC9,
+    0x5005713C, 0x270241AA, 0xBE0B1010, 0xC90C2086,
+    0x5768B525, 0x206F85B3, 0xB966D409, 0xCE61E49F,
+    0x5EDEF90E, 0x29D9C998, 0xB0D09822, 0xC7D7A8B4,
+    0x59B33D17, 0x2EB40D81, 0xB7BD5C3B, 0xC0BA6CAD,
+    0xEDB88320, 0x9ABFB3B6, 0x03B6E20C, 0x74B1D29A,
+    0xEAD54739, 0x9DD277AF, 0x04DB2615, 0x73DC1683,
+    0xE3630B12, 0x94643B84, 0x0D6D6A3E, 0x7A6A5AA8,
+    0xE40ECF0B, 0x9309FF9D, 0x0A00AE27, 0x7D079EB1,
+    0xF00F9344, 0x8708A3D2, 0x1E01F268, 0x6906C2FE,
+    0xF762575D, 0x806567CB, 0x196C3671, 0x6E6B06E7,
+    0xFED41B76, 0x89D32BE0, 0x10DA7A5A, 0x67DD4ACC,
+    0xF9B9DF6F, 0x8EBEEFF9, 0x17B7BE43, 0x60B08ED5,
+    0xD6D6A3E8, 0xA1D1937E, 0x38D8C2C4, 0x4FDFF252,
+    0xD1BB67F1, 0xA6BC5767, 0x3FB506DD, 0x48B2364B,
+    0xD80D2BDA, 0xAF0A1B4C, 0x36034AF6, 0x41047A60,
+    0xDF60EFC3, 0xA867DF55, 0x316E8EEF, 0x4669BE79,
+    0xCB61B38C, 0xBC66831A, 0x256FD2A0, 0x5268E236,
+    0xCC0C7795, 0xBB0B4703, 0x220216B9, 0x5505262F,
+    0xC5BA3BBE, 0xB2BD0B28, 0x2BB45A92, 0x5CB36A04,
+    0xC2D7FFA7, 0xB5D0CF31, 0x2CD99E8B, 0x5BDEAE1D,
+    0x9B64C2B0, 0xEC63F226, 0x756AA39C, 0x026D930A,
+    0x9C0906A9, 0xEB0E363F, 0x72076785, 0x05005713,
+    0x95BF4A82, 0xE2B87A14, 0x7BB12BAE, 0x0CB61B38,
+    0x92D28E9B, 0xE5D5BE0D, 0x7CDCEFB7, 0x0BDBDF21,
+    0x86D3D2D4, 0xF1D4E242, 0x68DDB3F8, 0x1FDA836E,
+    0x81BE16CD, 0xF6B9265B, 0x6FB077E1, 0x18B74777,
+    0x88085AE6, 0xFF0F6A70, 0x66063BCA, 0x11010B5C,
+    0x8F659EFF, 0xF862AE69, 0x616BFFD3, 0x166CCF45,
+    0xA00AE278, 0xD70DD2EE, 0x4E048354, 0x3903B3C2,
+    0xA7672661, 0xD06016F7, 0x4969474D, 0x3E6E77DB,
+    0xAED16A4A, 0xD9D65ADC, 0x40DF0B66, 0x37D83BF0,
+    0xA9BCAE53, 0xDEBB9EC5, 0x47B2CF7F, 0x30B5FFE9,
+    0xBDBDF21C, 0xCABAC28A, 0x53B39330, 0x24B4A3A6,
+    0xBAD03605, 0xCDD70693, 0x54DE5729, 0x23D967BF,
+    0xB3667A2E, 0xC4614AB8, 0x5D681B02, 0x2A6F2B94,
+    0xB40BBE37, 0xC30C8EA1, 0x5A05DF1B, 0x2D02EF8D
+};
+
+/*
+The binary number 1101 becomes x³ + x² + 0x + 1
+Each bit position represents a power of x
+Arithmetic is done in GF(2) - the finite field with just 0 and 1
+
+Addition is XOR (no carry)
+Subtraction equals addition (since 1+1=0 in GF(2))
+
+like:
+we have message: 11010011101100
+Generator polynomial: x³ + x + 1 (binary: 1011)
+1011 -> 1 (1) + 1 (x^1) + 0x (dont use this) + x^3 (because we have 101 (size 3) | why 3, not 4? cuz we add first 1 in start)
+crc width: 3 bits
+
+step 1:
+append 3 zeros to the message:
+11010011101100 000
+
+step 2:
+polynomial long division :
+
+11010011101100 000
+1011              ← divisor
+------------------
+01100011101100 000
+ 1011             ← divisor shifted
+------------------
+00111011101100 000
+  1011
+------------------
+00010111101100 000
+   1011
+------------------
+00000001101100 000
+       1011
+------------------
+00000000110100 000
+        1011
+------------------
+00000000011000 000
+         1011
+------------------
+00000000001110 000
+          1011
+------------------
+00000000000101 000
+           101 1
+------------------
+00000000000000 100  ← This is the CRC (remainder)
+
+step 3:
+send data with CRC:
+
+the sender transmits: 11010011101100 + 100 (the CRC)
+
+step 4:
+verification:
+the receiver performs the same division on the received data + CRC. If the remainder is zero, the data is likely error-free.
+
+(!) CRC is NOT for security: (!)
+
+No authentication: An attacker can modify data and recalculate CRC
+Reversible: Unlike cryptographic hashes, CRC can be reversed
+Linear property: CRC(x⊕y) = CRC(x) ⊕ CRC(y) ⊕ c
+This was famously exploited in the WEP protocol vulnerability
+*/
+static uint32_t crc32_calculate(const void *data, size_t size) {
+    if (data == NULL && size > 0) return 0;
+
+    const uint8_t *bytes = (const uint8_t*)data;
+    uint32_t crc = 0xFFFFFFFF;
+
+    /*
+    // Current crc = 0xFFFFFFFF (before processing)
+crc >> 8 = 0x00FFFFFF
+// 11111111 11111111 11111111 11111111 shifted right 8:
+// 00000000 11111111 11111111 11111111
+
+// Look up table[0xBE] = 0x352441C2 (hypothetical value)
+// XOR: 0x352441C2 ^ 0x00FFFFFF = 0x35DBBE3D
+    */
+    for (size_t i = 0; i < size; i++) {
+        crc = crc32_table[(crc ^ bytes[i]) & 0xFF] ^ (crc >> 8);
+    }
+
+    return crc ^ 0xFFFFFFFF;
+}
+
+// --- util function ---
+static uint64_t get_nano_timestamp(void) {
+    /*
+    struct timespec {
+           time_t     tv_sec;   /* Seconds  
+           /* ...   tv_nsec;  /* Nanoseconds [0, 999'999'999]  
+       };
+    */
+    struct timespec ts;
+    smemset(&ts, 0, sizeof(ts));
+
+    /*
+    int clock_gettime(clockid_t clockid, struct timespec *tp);
+    */
+    clock_gettime(CLOCK_REALTIME, &ts);
+
+    /* 
+    in one sec -> 1 000 000 000 + nanosec
+    */
+    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+struct wal_context *wal_init(const char *wal_file_path) {
+    if (!wal_file_path) return NULL;
+
+    struct wal_context *ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        fprintf(stderr, "WAL: Failed to allocate context\n");
+        return NULL;
+    }
+
+    ctx->wal_file_path = strdup(wal_file_path);
+    if (!ctx->wal_file_path) {
+        fprintf(stderr, "WAL: Failed to allocate file path\n");
+        free(ctx);
+        return NULL;
+    }
+    
+    ctx->buffer.buffer_size = WAL_DEFAULT_FILE_SIZE;
+    ctx->buffer.buffer = calloc(1, sizeof(ctx->buffer.buffer_size));
+    if (!ctx->buffer.buffer) {
+        fprintf(stderr, "WAL: Failed to allocate buffer\n");
+        free(ctx->wal_file_path);
+        free(ctx);
+        return NULL;
+    }
+
+    pthread_mutex_init(&ctx->wal_lock, NULL);
+    pthread_mutex_init(&ctx->buffer.buffer_lock, NULL);
+    pthread_cond_init(&ctx->flush_cond, NULL);
+    
+    ctx->wal_file_fd = -1;
+    ctx->is_open = false;
+    ctx->last_lsn = 0;
+    ctx->last_flushed_lsn = 0;
+    ctx->last_checkpoint_lsn = 0;
+    ctx->transaction_id = 1;
+    ctx->in_recovery = false;
+    ctx->recovery_errors = 0;
+    
+    crc32_init();
+    
+    return ctx;
+}
+
+_Bool wal_open(struct wal_context *ctx) {
+    if (!ctx || !ctx->wal_file_path) return false;
+
+    pthread_mutex_lock(&ctx->wal_lock);
+
+    if (ctx->is_open) {
+        pthread_mutex_unlock(&ctx->wal_lock);
+        return true;
+    }
+
+    /*
+    specifies that the file owner has read and write permissions, while the group and others have read-only permissions
+    */
+    ctx->wal_file_fd = open(ctx->wal_file_path, O_RDWR | O_CREAT, 0644);
+    if (ctx->wal_file_fd < 0) {
+        fprintf(stderr, "WAL: Failed to open file: %s (errno=%d)\n", 
+                ctx->wal_file_path, errno);
+        pthread_mutex_unlock(&ctx->wal_lock);
+        return false;
+    }
+
+    struct stat st;
+    smemset(&st, 0, sizeof(st));
+    
+    /*
+    stat and fstat are system functions used to retrieve metadata about a file, such as its size, permissions, and creation time. They do not read the content of the file, only its details.
+
+    stat uses a path: You pass the file's name or path as a string. The file does not need to be open.fstat uses a file descriptor: You pass an integer file descriptor (fd) of a file that you have already opened using open().
+    */
+    if (fstat(ctx->wal_file_fd, &st) == 0 && st.st_size > 0) {
+        struct wal_header header;
+        smemset(&header, 0, sizeof(header));
+
+        /*
+        pread, pwrite - read from or write to a file descriptor at a given
+        offset
+
+        ssize_t pread(size_t count;
+                     int fd, void buf[count], size_t count,
+                     off_t offset);
+
+        (Note: Traditional systems write this identically as ssize_t pread(int fd, void *buf, size_t count, off_t offset);) warning (!)
+        */
+        ssize_t bytes_read = pread(ctx->wal_file_fd, &header, sizeof(header), 0);
+
+        if (bytes_read != sizeof(header)) {
+            fprintf(stderr, "WAL: Failed to read header\n");
+            close(ctx->wal_file_fd);
+            ctx->wal_file_fd = -1;
+            pthread_mutex_unlock(&ctx->wal_lock);
+            return false;
+        }
+
+        if (header.magic != WAL_MAGIC_NUMBER || header.version != WAL_VERSION) {
+            fprintf(stderr, "WAL: Invalid header magic or version\n");
+            close(ctx->wal_file_fd);
+            ctx->wal_file_fd = -1;
+            pthread_mutex_unlock(&ctx->wal_lock);
+            return false;
+        }
+
+        ctx->last_lsn = header.last_lsn;
+        ctx->last_checkpoint_lsn = header.last_checkpoint_lsn;
+        ctx->buffer.current_offset = sizeof(struct wal_header);
+    } else {
+        struct wal_header header;
+        smemset(&header, 0, sizeof(header));
+
+        header.magic = WAL_MAGIC_NUMBER;
+        header.version = WAL_VERSION;
+        header.last_lsn = 0;
+        header.last_checkpoint_lsn = 0;
+        header.last_checkpoint_time = get_timestamp();
+        header.page_size = WAL_PAGE_SIZE;
+        header.record_count = 0;
+        header.checksum = 0;
+        header.flags = 0;
+        
+        ssize_t bytes_written = pwrite(ctx->wal_file_fd, &header, sizeof(header), 0);
+        if (bytes_written != sizeof(header)) {
+            fprintf(stderr, "WAL: Failed to write header\n");
+            close(ctx->wal_file_fd);
+            ctx->wal_file_fd = -1;
+            pthread_mutex_unlock(&ctx->wal_lock);
+            return false;
+        }
+
+        fsync(ctx->wal_file_fd);
+        ctx->buffer.current_offset = sizeof(struct wal_header);
+    }
+
+    ctx->is_open = true;
+    pthread_mutex_unlock(&ctx->wal_lock);
+
+    return true;
+}
+
+/*
+record:
+block1 
+block2
+...
+*/
+static uint64_t wal_append_record(struct wal_context *ctx, uint32_t record_type, const void *payload, uint32_t payload_size) {
+    if (!ctx || !ctx->is_open) return 0;
+
+    pthread_mutex_lock(&ctx->wal_lock);
+
+    uint32_t record_size = sizeof(struct wal_record_header) + payload_size;
+
+    /*
+    if buffer is full -> flush
+    */
+    if (ctx->buffer.current_offset + record_size > ctx->buffer.buffer_size) {
+        if (ctx->buffer.current_offset > sizeof(struct wal_header)) {
+            size_t bytes_to_write = ctx->buffer.current_offset - sizeof(struct wal_header);
+            /*
+            off_t is used for describing file sizes. It is a signed integer type.
+            */
+            off_t file_offset = sizeof(struct wal_header) + ctx->total_bytes_written;
+
+            /*
+            ssize_t pwrite(size_t count;
+                     int fd, const void buf[count], size_t count,
+                     off_t offset);
+            */
+            ssize_t written = pwrite(ctx->wal_file_fd, ctx->buffer.buffer + sizeof(struct wal_header), bytes_to_write, file_offset);
+
+            if (written == (ssize_t)bytes_to_write) {
+                ctx->total_flushes++;
+                ctx->total_bytes_written += written;
+                ctx->last_flushed_lsn = ctx->last_lsn;
+
+                ctx->buffer.current_offset = sizeof(struct wal_header);
+            } else if (written < 0) {
+                perror("WAL pwrite failed");
+                return 0;
+            } else {
+                fprintf(stderr, "CRITICAL: WAL partial write occurred (%ld of %zu bytes)\n", written, bytes_to_write);
+                return 0;
+            }
+        }
+        // ctx->buffer.current_offset = sizeof(struct wal_header);
+    }
+
+    struct wal_record_header record_header;
+    smemset(&record_header, 0, sizeof(record_header));
+
+    ctx->last_lsn++;
+    record_header.lsn = ctx->last_lsn;
+    record_header.prev_lsn = ctx->last_lsn - 1;
+    record_header.transaction_id = ctx->transaction_id;
+    record_header.record_type = record_type;
+    record_header.record_size = record_size;
+    record_header.data_size = payload_size;
+    record_header.flags = 0;
+    record_header.timestamp = get_timestamp();
+
+    
+}
