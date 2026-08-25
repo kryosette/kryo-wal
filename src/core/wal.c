@@ -679,5 +679,33 @@ static uint64_t wal_append_record(struct wal_context *ctx, uint32_t record_type,
     record_header.flags = 0;
     record_header.timestamp = get_timestamp();
 
+    memcpy(ctx->buffer.buffer + ctx->buffer.current_offset, 
+           &record_header, sizeof(record_header));
+    ctx->buffer.current_offset += sizeof(record_header);
     
+    // Write payload
+    if (payload && payload_size > 0) {
+        memcpy(ctx->buffer.buffer + ctx->buffer.current_offset,
+               payload, payload_size);
+        ctx->buffer.current_offset += payload_size;
+    }
+    
+    // Calculate CRC
+    uint32_t crc = crc32_calculate(ctx->buffer.buffer + 
+                                    ctx->buffer.current_offset - record_size,
+                                    record_size - sizeof(uint32_t));
+    
+    // Write CRC
+    memcpy(ctx->buffer.buffer + ctx->buffer.current_offset - sizeof(uint32_t),
+           &crc, sizeof(crc));
+    
+    ctx->total_records_written++;
+    ctx->total_bytes_written += record_size;
+    
+    uint64_t lsn = record_header.lsn;
+    
+    pthread_mutex_unlock(&ctx->wal_lock);
+    
+    return lsn;    
 }
+
