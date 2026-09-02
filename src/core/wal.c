@@ -709,3 +709,92 @@ static uint64_t wal_append_record(struct wal_context *ctx, uint32_t record_type,
     return lsn;    
 }
 
+uint64_t wal_write_alloc(struct wal_context *ctx, void *user_ptr, void *block_ptr, uint64_t region_id, uint32_t block_size, uint32_t class_index) {
+    struct wal_alloc_payload payload;
+    smemset(&payload, 0, sizeof(payload));
+
+    payload.user_ptr = user_ptr;
+    payload.block_ptr = block_ptr;
+    payload.region_id = region_id;
+    payload.block_size = block_size;
+    payload.class_index = class_index;
+    payload.thread_id = (uint32_t)(uintptr_t)pthread_self();
+    payload.alignment = 16;
+
+    return wal_append_record(ctx, WAL_RECORD_ALLOC, &payload, sizeof(payload));
+}
+
+uint64_t wal_write_free(struct wal_context *ctx, void *user_ptr,
+                        void *block_ptr, uint64_t region_id,
+                        uint32_t block_size) {
+    struct wal_free_payload payload;
+    smemset(&payload, 0, sizeof(payload));
+    
+    payload.user_ptr = user_ptr;
+    payload.block_ptr = block_ptr;
+    payload.region_id = region_id;
+    payload.block_size = block_size;
+    payload.thread_id = (uint32_t)(uintptr_t)pthread_self();
+    payload.free_reason = 0;
+    
+    return wal_append_record(ctx, WAL_RECORD_FREE, &payload, sizeof(payload));
+}
+
+uint64_t wal_write_split(struct wal_context *ctx, void *original_block,
+                         void *new_block, uint32_t original_size,
+                         uint32_t new_size, uint32_t remaining_size) {
+    struct wal_split_payload payload;
+    smemset(&payload, 0, sizeof(payload));
+    
+    payload.original_block = original_block;
+    payload.new_block = new_block;
+    payload.original_size = original_size;
+    payload.new_size = new_size;
+    payload.remaining_size = remaining_size;
+    
+    return wal_append_record(ctx, WAL_RECORD_SPLIT, &payload, sizeof(payload));
+}
+
+uint64_t wal_write_coalesce(struct wal_context *ctx, void *block1,
+                            void *block2, uint32_t block1_size,
+                            uint32_t block2_size, uint32_t coalesced_size) {
+    struct wal_coalesce_payload payload;
+    smemset(&payload, 0, sizeof(payload));
+    
+    payload.block1 = block1;
+    payload.block2 = block2;
+    payload.block1_size = block1_size;
+    payload.block2_size = block2_size;
+    payload.coalesced_size = coalesced_size;
+    
+    return wal_append_record(ctx, WAL_RECORD_COALESCE, &payload, sizeof(payload));
+}
+
+uint64_t wal_write_region(struct wal_context *ctx, void *region_base,
+                          uint32_t region_id, uint32_t region_size,
+                          uint32_t canary) {
+    struct wal_region_payload payload;
+    smemset(&payload, 0, sizeof(payload));
+    
+    payload.region_base = region_base;
+    payload.region_id = region_id;
+    payload.region_size = region_size;
+    payload.region_flags = 0;
+    payload.canary = canary;
+    
+    return wal_append_record(ctx, WAL_RECORD_REGION_CREATE, &payload, sizeof(payload));
+}
+
+uint64_t wal_write_checkpoint(struct wal_context *ctx) {
+    struct wal_checkpoint_payload payload;
+    smemset(&payload, 0, sizeof(payload));
+    
+    payload.checkpoint_lsn = ctx->last_lsn;
+    payload.total_regions = 0;
+    payload.total_allocations = 0;
+    payload.total_frees = 0;
+    payload.total_memory = 0;
+    payload.free_memory = 0;
+    
+    return wal_append_record(ctx, WAL_RECORD_CHECKPOINT, &payload, sizeof(payload));
+}
